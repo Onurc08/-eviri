@@ -45,6 +45,7 @@ class MainActivity : Activity() {
         }
         seek("Altyazı alanı başlangıcı (yukarıdan)", "top", 75)
         seek("Altyazı alanı bitişi", "bottom", 95)
+        seek("Çeviri yazı boyutu", "size", 50)
 
         root.addView(Button(this).apply {
             text = "Başlat"

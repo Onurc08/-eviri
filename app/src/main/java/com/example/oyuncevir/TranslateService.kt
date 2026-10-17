@@ -172,6 +172,8 @@ class TranslateService : Service() {
     }
 
     private fun showText(t: String) {
+        val prefs = getSharedPreferences("p", Context.MODE_PRIVATE)
+        overlay?.textSize = 16f + prefs.getInt("size", 50) / 100f * 48f
         overlay?.text = t
         overlay?.visibility = View.VISIBLE
     }
