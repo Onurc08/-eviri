@@ -19,6 +19,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
@@ -30,6 +31,11 @@ import com.google.mlkit.nl.translate.TranslatorOptions
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+import org.json.JSONArray
+import java.net.HttpURLConnection
+import java.net.URL
+import java.net.URLEncoder
+import java.util.concurrent.Executors
 
 class TranslateService : Service() {
 
@@ -38,6 +44,7 @@ class TranslateService : Service() {
     private var reader: ImageReader? = null
     private var display: VirtualDisplay? = null
     private var overlay: TextView? = null
+    private val added = mutableListOf<View>()
     private lateinit var wm: WindowManager
 
     private val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
@@ -48,12 +55,17 @@ class TranslateService : Service() {
             .build()
     )
 
+    private val executor = Executors.newSingleThreadExecutor()
     private var modelReady = false
     private var busy = false
     private var lastWords: Set<String> = emptySet()
     private var emptyCount = 0
     private var width = 0
     private var height = 0
+    private var subX = 0
+    private var subY = 0
+    private var subW = 0
+    private var subH = 0
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -71,32 +83,56 @@ class TranslateService : Service() {
             override fun onStop() { stopSelf() }
         }, handler)
 
-        val dm = resources.displayMetrics
-        width = dm.widthPixels
-        height = dm.heightPixels
+        val (w, h) = Cfg.screen(this)
+        width = w
+        height = h
+        val dpi = resources.displayMetrics.densityDpi
         reader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
         display = projection?.createVirtualDisplay(
-            "oyuncevir", width, height, dm.densityDpi,
+            "oyuncevir", width, height, dpi,
             DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
             reader!!.surface, null, null
         )
 
         wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
-        createOverlay()
-        showText("Çeviri modeli hazırlanıyor… (ilk seferde internet gerekir)")
 
+        // Altyazı okuma alanı (piksel)
+        val sub = Cfg.load(this, "sub", Cfg.SUB_DEF)
+        subX = (sub.l * width).toInt().coerceIn(0, width - 20)
+        subY = (sub.t * height).toInt().coerceIn(0, height - 20)
+        subW = (sub.w * width).toInt().coerceIn(20, width - subX)
+        subH = (sub.h * height).toInt().coerceIn(20, height - subY)
+
+        val prefs = getSharedPreferences("p", Context.MODE_PRIVATE)
+
+        // Oyunu gizleyen siyah şeritler: altyazı alanı açık kalır, çünkü okunması gerekiyor
+        if (prefs.getBoolean("cover", true)) {
+            fun bar(x: Int, y: Int, bw: Int, bh: Int) {
+                if (bw > 0 && bh > 0) {
+                    addWin(View(this).apply { setBackgroundColor(Color.BLACK) }, x, y, bw, bh)
+                }
+            }
+            bar(0, 0, width, subY)
+            bar(0, subY + subH, width, height - subY - subH)
+            bar(0, subY, subX, subH)
+            bar(subX + subW, subY, width - subX - subW, subH)
+        }
+
+        createOverlay(prefs.getInt("size", 50))
+        // Çevrimdışı yedek model arka planda iner; asıl çeviri Google ile yapılır
         translator.downloadModelIfNeeded(DownloadConditions.Builder().build())
-            .addOnSuccessListener { modelReady = true; showText("Hazır. Oyuna geç.") ; hideLater() }
-            .addOnFailureListener { showText("Model indirilemedi, interneti kontrol et.") }
+            .addOnSuccessListener { modelReady = true }
+        showText("Hazır. Oyuna geç.")
+        hideLater()
 
-        handler.postDelayed(loop, 800)
+        handler.postDelayed(loop, 500)
         return START_NOT_STICKY
     }
 
     private val loop = object : Runnable {
         override fun run() {
-            if (modelReady && !busy) captureAndTranslate()
-            handler.postDelayed(this, 800)
+            if (!busy) captureAndTranslate()
+            handler.postDelayed(this, 500)
         }
     }
 
@@ -110,10 +146,7 @@ class TranslateService : Service() {
                 width + rowPadding / plane.pixelStride, height, Bitmap.Config.ARGB_8888
             )
             full.copyPixelsFromBuffer(plane.buffer)
-            val prefs = getSharedPreferences("p", Context.MODE_PRIVATE)
-            val top = (height * prefs.getInt("top", 75) / 100).coerceIn(0, height - 20)
-            val bottom = (height * prefs.getInt("bottom", 95) / 100).coerceIn(top + 20, height)
-            crop = Bitmap.createBitmap(full, 0, top, width, bottom - top)
+            crop = Bitmap.createBitmap(full, subX, subY, subW, subH)
             full.recycle()
         } finally {
             image.close()
@@ -134,13 +167,55 @@ class TranslateService : Service() {
                         busy = false
                     } else {
                         lastWords = words
-                        translator.translate(text)
-                            .addOnSuccessListener { showText(it); busy = false }
-                            .addOnFailureListener { busy = false }
+                        translateText(text.take(500)) { out ->
+                            if (out != null) showText(out) else lastWords = emptySet()
+                            busy = false
+                        }
                     }
                 }
             }
             .addOnFailureListener { busy = false }
+    }
+
+    // Önce Google, olmazsa çevrimdışı ML Kit. Geri çağrı her zaman ana iş parçacığında çalışır.
+    private fun translateText(text: String, cb: (String?) -> Unit) {
+        executor.execute {
+            val g = googleTranslate(text)
+            if (g != null) {
+                handler.post { cb(g) }
+            } else {
+                handler.post {
+                    if (modelReady) {
+                        translator.translate(text)
+                            .addOnSuccessListener { cb(it) }
+                            .addOnFailureListener { cb(null) }
+                    } else {
+                        cb(null)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun googleTranslate(text: String): String? {
+        return try {
+            val url = URL(
+                "https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=tr&dt=t&q=" +
+                    URLEncoder.encode(text, "UTF-8")
+            )
+            val c = url.openConnection() as HttpURLConnection
+            c.connectTimeout = 3000
+            c.readTimeout = 3000
+            c.setRequestProperty("User-Agent", "Mozilla/5.0")
+            if (c.responseCode != 200) return null
+            val body = c.inputStream.bufferedReader().use { it.readText() }
+            val arr = JSONArray(body).getJSONArray(0)
+            val sb = StringBuilder()
+            for (i in 0 until arr.length()) sb.append(arr.getJSONArray(i).getString(0))
+            sb.toString().ifBlank { null }
+        } catch (e: Exception) {
+            null
+        }
     }
 
     private fun isSame(a: Set<String>, b: Set<String>): Boolean {
@@ -150,30 +225,44 @@ class TranslateService : Service() {
         return inter / union > 0.8f
     }
 
-    private fun createOverlay() {
-        overlay = TextView(this).apply {
-            setTextColor(Color.WHITE)
-            setBackgroundColor(0xB3000000.toInt())
-            textSize = 22f
-            gravity = Gravity.CENTER
-            setPadding(32, 20, 32, 20)
-            visibility = View.GONE
-        }
-        val params = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.WRAP_CONTENT,
+    private fun addWin(v: View, x: Int, y: Int, w: Int, h: Int) {
+        val lp = WindowManager.LayoutParams(
+            w, h,
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
             PixelFormat.TRANSLUCENT
-        ).apply { gravity = Gravity.TOP }
-        wm.addView(overlay, params)
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            this.x = x
+            this.y = y
+        }
+        wm.addView(v, lp)
+        added.add(v)
+    }
+
+    private fun createOverlay(sizePct: Int) {
+        val tr = Cfg.load(this, "tr", Cfg.TR_DEF)
+        val maxSp = 20 + sizePct * 80 / 100
+        val tv = TextView(this).apply {
+            setTextColor(Color.WHITE)
+            setBackgroundColor(0xE6000000.toInt())
+            gravity = Gravity.CENTER
+            setPadding(24, 16, 24, 16)
+            setAutoSizeTextTypeUniformWithConfiguration(14, maxSp, 2, TypedValue.COMPLEX_UNIT_SP)
+            visibility = View.GONE
+        }
+        overlay = tv
+        addWin(
+            tv,
+            (tr.l * width).toInt(), (tr.t * height).toInt(),
+            (tr.w * width).toInt().coerceAtLeast(200), (tr.h * height).toInt().coerceAtLeast(100)
+        )
     }
 
     private fun showText(t: String) {
-        val prefs = getSharedPreferences("p", Context.MODE_PRIVATE)
-        overlay?.textSize = 16f + prefs.getInt("size", 50) / 100f * 48f
         overlay?.text = t
         overlay?.visibility = View.VISIBLE
     }
@@ -201,7 +290,11 @@ class TranslateService : Service() {
         display?.release()
         reader?.close()
         projection?.stop()
-        overlay?.let { try { wm.removeView(it) } catch (_: Exception) {} }
+        if (::wm.isInitialized) {
+            added.forEach { try { wm.removeView(it) } catch (_: Exception) {} }
+        }
+        added.clear()
+        executor.shutdownNow()
         recognizer.close()
         translator.close()
         super.onDestroy()
